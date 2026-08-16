@@ -65,6 +65,32 @@ function simulate({ shipSteel = 0.35, lockTurn = {}, noise = null, turns = 16 })
   return { rows, breach };
 }
 
+/* 石油が尽きるまでの月数。四半期内は線形補間する。
+   期間を通して尽きなければ 48ヶ月 ＋ 残存石油による僅差の加点。 */
+function survivalMonths({ shipSteel, lockTurn = {} }) {
+  const { rows, breach } = simulate({ shipSteel, lockTurn });
+  if (breach == null) {
+    const last = rows[rows.length - 1];
+    return 48 + last.O / 1000;
+  }
+  const prev = breach === 0 ? 840 : rows[breach - 1].O;
+  const cur = rows[breach].O;
+  const frac = prev > cur ? prev / (prev - cur) : 0;
+  return (breach + frac) * 3;
+}
+
+/* 造船配分を総当たりして最適点を求める（一次元の完全探索） */
+function solveBestAllocation(lockTurn = {}) {
+  const scan = [];
+  for (let x = 5; x <= 90; x++) {
+    const ss = x / 100;
+    scan.push({ ss, m: survivalMonths({ shipSteel: ss, lockTurn }) });
+  }
+  const best = scan.reduce((a, b) => (b.m > a.m ? b : a));
+  const worst = scan.reduce((a, b) => (b.m < a.m ? b : a));
+  return { scan, best, worst };
+}
+
 /* 標準正規乱数 */
 function gauss() {
   let u = 0, v = 0;
@@ -156,6 +182,42 @@ const P26 = {
    小部品
    ========================================================================= */
 
+/* 画面に入ってから押印する。スマホで下までスクロールした時点で発火させる。 */
+function StampOnView({ text, color }) {
+  const ref = useRef(null);
+  const [fired, setFired] = useState(false);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    if (typeof IntersectionObserver === "undefined") { setFired(true); return; }
+    const io = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((e) => {
+          if (e.isIntersecting) { setFired(true); io.disconnect(); }
+        });
+      },
+      { threshold: 0.75 }
+    );
+    io.observe(el);
+    return () => io.disconnect();
+  }, []);
+
+  return (
+    <div ref={ref} className="flex items-center justify-center" style={{ minHeight: 92 }}>
+      {fired ? (
+        <div style={{ animation: "vp-stamp 720ms cubic-bezier(.3,1.5,.4,1) both" }}>
+          <Stamp text={text} color={color} />
+        </div>
+      ) : (
+        <div style={{ color, opacity: 0.22, fontSize: 11, letterSpacing: "0.3em" }}>
+          ▼ 決裁を待っている
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Stamp({ text, color, angle = -12 }) {
   return (
     <div
@@ -184,9 +246,11 @@ function Num({ v, digits = 0, color }) {
 
 const GLOSSARY = {
   "船腹": "国が持っている輸送船の合計。当時の公文書の言い方で、いまなら「輸送船の総量」。単位は万総トン。",
-  "総トン": "船の大きさを表す単位。積める荷物の量にほぼ比例する。1万総トンでおおよそ大型貨物船1〜2隻分。",
+  "総トン": "船の大きさを表す国際的な指標。船の重さではなく、上部構造物を含む船全体の容積（密閉された空間の広さ）をもとに算出される。積める荷物の量にほぼ比例するため、輸送力を測る尺度として使われた。",
+  "万総トン": "総トンの1万倍。総トンは船の重さではなく、上部構造物を含む船全体の容積（密閉された空間の広さ）をベースに算出された国際的な指標です。1万総トンでおおよそ大型貨物船1〜2隻分にあたる。本作では国全体の輸送船の合計をこの単位で表している。",
   "万kl": "石油の量の単位。1万klは、家庭用の風呂おけ約5万杯分。当時の日本は年間およそ500万klを消費していた。",
   "船台": "造船所で船を組み立てる台。数が限られているため、鉄がいくらあっても同時に造れる船の数には上限がある。",
+  "鉄鋼": "本作では四半期あたりに生産できる量を指す。開戦時の値 145万トン は、当時の日本の粗鋼生産が年間およそ580万トンだったことに対応する（580 ÷ 4 ≒ 145）。上限を 155万トン に置いているのは、鉄鉱石と石炭がいくら届いても設備能力を超えては作れないため。船腹が減ると還送量が落ち、この生産量自体が上限を下回っていく。",
   "還送": "占領地から資源を船で運んで持ち帰ること。いまなら「輸入」に近いが、自国の勢力圏内から運ぶ点が違う。",
   "損耗率": "一定期間に失われる割合。ここでは、持っている輸送船のうち何％が沈むか。",
   "積算表": "手作業で数字を積み上げて集計した表。いまの表計算ソフトにあたるものを、紙と算盤でやっていた。",
@@ -234,7 +298,7 @@ function GlossaryLayer({ era }) {
       <button onClick={() => setList(true)}
         className="fixed px-3 py-2"
         style={{
-          right: 12, bottom: 12, zIndex: 40, background: bg,
+          right: 12, bottom: 84, zIndex: 40, background: bg,
           border: `1px solid ${line}`, color: sub, fontSize: 11, letterSpacing: "0.15em",
         }}>
         用語
@@ -749,12 +813,87 @@ function Formula({ era, lines }) {
 }
 
 /* 造船量と喪失量の計算内訳 */
+/* 折り畳みを開かなくても見える、今期の状態 */
+function SteelStatus({ era, row }) {
+  const dark = era !== 1941;
+  const collapsing = row.strain > 1.02;
+  const pct = Math.round((row.strain - 1) * 100);
+  const red = dark ? P26.red : P41.red;
+
+  return (
+    <div className="mt-3 space-y-2">
+      <div className="px-3 py-3" style={{
+        border: `1px solid ${row.yardBound ? (dark ? P26.amber : P41.red) : (dark ? P26.line : P41.rule)}`,
+        color: dark ? P26.text : P41.ink2,
+      }}>
+        <div style={{
+          color: row.yardBound ? (dark ? P26.amber : P41.red) : (dark ? P26.cyan : P41.ink),
+          fontSize: 12, fontWeight: 700, letterSpacing: "0.05em",
+        }} className="mb-1">
+          {row.yardBound ? "いま効いているのは、鉄の量ではない" : "いまは鉄の量が効いている"}
+        </div>
+        <div style={{ fontSize: 11, lineHeight: 1.9 }}>
+          {row.yardBound ? (
+            <>
+              造船を縛っているのは<b>船台の数</b>だ。鉄を {row.steelToShips.toFixed(1)} 万総トン ぶん回しても、
+              組めるのは {row.yardCap.toFixed(1)} 万総トン まで。
+              ここを取り違えると、<b>効かないレバーを握り続けることになる</b>。
+            </>
+          ) : (
+            <>
+              回した鉄がそのまま船になっている。ただし造船に寄せすぎると兵器が減り、
+              <b>前線の負荷が上がって喪失が増える</b>。増やせば増やすほど良い、とはならない。
+            </>
+          )}
+        </div>
+      </div>
+
+      {collapsing && (
+        <div className="px-3 py-3" style={{ border: `2px solid ${red}`, background: dark ? P26.panel2 : P41.paper2 }}>
+          <div className="flex items-baseline justify-between mb-1">
+            <span style={{ color: red, fontSize: 13, fontWeight: 700, letterSpacing: "0.1em" }}>
+              前線が崩れている
+            </span>
+            <span style={{ color: red, fontFamily: "ui-monospace, monospace", fontSize: 20 }}>
+              +{pct}％
+            </span>
+          </div>
+          <div style={{ color: red, fontSize: 11, lineHeight: 1.8 }}>
+            兵器に回す鉄が足りない。制空権と護衛が失われ、
+            <b>船の沈む速さが {pct}％ 上がっている</b>。
+            造船に寄せた分が、そのまま沈没量に化けている。
+          </div>
+          <div className="mt-2" style={{
+            height: 6, background: dark ? P26.panel : P41.paper,
+            border: `1px solid ${red}`,
+          }}>
+            <div style={{ width: `${Math.min(pct / 40 * 100, 100)}%`, height: "100%", background: red }} />
+          </div>
+        </div>
+      )}
+
+      <div className="px-3 py-2 flex items-baseline justify-between" style={{
+        border: `1px solid ${row.delta < 0 ? red : (dark ? P26.line : P41.rule)}`,
+      }}>
+        <span style={{ color: dark ? P26.dim : P41.ink3, fontSize: 11 }}>この配分での今期の差引</span>
+        <span style={{ color: row.delta < 0 ? red : (dark ? P26.cyan : P41.ink) }}>
+          <span style={{ fontFamily: "ui-monospace, monospace", fontSize: 17 }}>
+            {row.delta > 0 ? "＋" : "−"}{Math.abs(row.delta).toFixed(1)}
+          </span>
+          <span style={{ fontSize: 11 }}> 万総トン</span>
+        </span>
+      </div>
+    </div>
+  );
+}
+
 function SteelMath({ era, row, shipSteel }) {
   const [open, setOpen] = useState(false);
   const dark = era !== 1941;
   const f = (x, d = 1) => x.toFixed(d);
 
   const pc = Math.round(shipSteel * 100);
+  const shortfall = Math.max(0, 60 - row.weapon);
   const lines = [
     { t: `【造船】` },
     { t: `造船に回した鉄` },
@@ -762,8 +901,12 @@ function SteelMath({ era, row, shipSteel }) {
     { t: `鉄からできる船` },
     { t: `= ${f(row.steelBefore * shipSteel)} × 0.52 = ${f(row.steelToShips)} 万総トン`, ind: true },
     { t: `船台で組める上限 = ${f(row.yardCap)} 万総トン` },
-    { t: `造船量`, hi: true },
-    { t: `= min(${f(row.steelToShips)}, ${f(row.yardCap)}) = ${f(row.build)} 万総トン`, ind: true, hi: true },
+    { t: `造船量 は、この二つのうち小さいほう`, hi: true },
+    {
+      t: `= ${f(row.steelToShips)} 万総トン と ${f(row.yardCap)} 万総トン の小さいほう`,
+      ind: true, hi: true,
+    },
+    { t: `= ${f(row.build)} 万総トン`, ind: true, hi: true },
     {
       t: row.yardBound ? `↑ 船台が上限。鉄を増やしても船は増えない`
                        : `↑ 鉄が上限。鉄を増やせば船も増える`,
@@ -773,22 +916,28 @@ function SteelMath({ era, row, shipSteel }) {
     { t: `【喪失】` },
     { t: `兵器に回した鉄` },
     { t: `= ${f(row.steelBefore)} × ${100 - pc}％ = ${f(row.weapon)} 万トン`, ind: true },
-    { t: `前線の負荷`, hi: row.strain > 1.02 },
-    { t: `= 1 + max(0, (60 − ${f(row.weapon)}) ÷ 60) × 0.40`, ind: true, hi: row.strain > 1.02 },
+    { t: `前線を維持するのに要る量 = 60 万トン` },
     {
-      t: `= ${f(row.strain, 2)} ${row.strain > 1.02 ? "（兵器が不足し前線が崩れている）" : "（兵器は足りている）"}`,
+      t: `不足 = ${f(row.weapon)} 万トン が 60 万トン に ${shortfall > 0 ? `${f(shortfall)} 万トン 足りない` : "達している（不足なし）"}`,
+      ind: true, hi: row.strain > 1.02,
+    },
+    { t: `前線の負荷`, hi: row.strain > 1.02 },
+    {
+      t: `= 1 + (不足 ${f(shortfall)} 万トン ÷ 60 万トン) × 0.40 = ${f(row.strain, 2)} 倍`,
       ind: true, hi: row.strain > 1.02,
     },
     { t: `損耗率` },
     { t: `= 基準 ${(row.lossRate / row.strain * 100).toFixed(1)}％ × ${f(row.strain, 2)} = ${(row.lossRate * 100).toFixed(1)}％`, ind: true },
     { t: `喪失量`, hi: true },
-    { t: `= ${f(row.T0)} × ${(row.lossRate * 100).toFixed(1)}％ = ${f(row.loss)} 万総トン`, ind: true, hi: true },
+    { t: `= ${f(row.T0)} 万総トン × ${(row.lossRate * 100).toFixed(1)}％ = ${f(row.loss)} 万総トン`, ind: true, hi: true },
     { t: `` },
-    { t: `差引 = ${f(row.build)} − ${f(row.loss)} = ${row.delta > 0 ? "＋" : "−"}${f(Math.abs(row.delta))}`, hi: true },
+    { t: `差引 = ${f(row.build)} − ${f(row.loss)} = ${row.delta > 0 ? "＋" : "−"}${f(Math.abs(row.delta))} 万総トン`, hi: true },
   ];
 
   return (
     <div className="mt-3">
+      <SteelStatus era={era} row={row} />
+      <div className="mt-3" />
       <button onClick={() => setOpen(!open)} className="w-full text-left px-3 py-2"
         style={{
           border: `1px solid ${dark ? P26.line : P41.rule}`,
@@ -799,13 +948,21 @@ function SteelMath({ era, row, shipSteel }) {
       {open && (
         <>
           <Formula era={era} lines={lines} />
-          <p className="mt-2" style={{
-            color: dark ? P26.dim : P41.ink3, fontSize: 10, lineHeight: 1.8,
-          }}>
-            {row.yardBound
-              ? "いま効いているのは船台の数であって、鉄の量ではない。ここを取り違えると、効かないレバーを握り続けることになる。"
-              : "いまは鉄の量が効いている。ただし造船に寄せすぎると兵器が減り、前線の負荷が上がって喪失が増える。"}
-          </p>
+          <div className="mt-3 pt-3 space-y-2" style={{ borderTop: `1px dashed ${dark ? P26.line : P41.rule}` }}>
+            <p style={{ color: dark ? P26.dim : P41.ink3, fontSize: 10, lineHeight: 1.8 }}>
+              <b style={{ color: dark ? P26.text : P41.ink2 }}>係数 0.52 について</b> —
+              船は鋼材をそのまま積み上げて出来るわけではない。切断や溶接で失われる分があり、
+              機関や艤装にも鋼材を食う。当時の貨物船では、
+              1総トンの船を造るのにおよそ 1.9 トンの鋼材を要した。その逆数が 0.52 にあたる。
+              つまり<b style={{ color: dark ? P26.text : P41.ink2 }}>鋼材1万トンから約5,200総トンの船</b>ができる。
+            </p>
+            <p style={{ color: dark ? P26.dim : P41.ink3, fontSize: 10, lineHeight: 1.8 }}>
+              <b style={{ color: dark ? P26.text : P41.ink2 }}>「小さいほう」について</b> —
+              鉄がいくらあっても船台が足りなければ組めず、船台が空いていても鉄がなければ造れない。
+              こういう場合、実際に出来る量は<b style={{ color: dark ? P26.text : P41.ink2 }}>両者のうち小さいほう</b>で決まる。
+              数学ではこれを min(a, b) と書く。
+            </p>
+          </div>
         </>
       )}
     </div>
@@ -958,6 +1115,196 @@ function CreditStrip({ era, credit, submitted, resolved }) {
 }
 
 /* =========================================================================
+   所見 — 毎期、その期に固有の気づきを一つだけ返す
+   ========================================================================= */
+
+function remark1941({ rows, turn, allocLog, used = [] }) {
+  const fresh = (tag) => !used.includes(tag);
+  const r = rows[turn];
+  const prev = turn > 0 ? rows[turn - 1] : null;
+  const f = (x, d = 1) => x.toFixed(d);
+
+  /* 配分を大きく動かしたのに造船量が変わらなかった */
+  if (allocLog.length >= 2) {
+    const a = allocLog[allocLog.length - 2], b = allocLog[allocLog.length - 1];
+    if (Math.abs(b - a) >= 0.15 && r.yardBound) {
+      return {
+        tag: "配分",
+        head: "レバーを動かしたが、盤面が動かない",
+        body: `造船配分を ${Math.round(a * 100)}％ から ${Math.round(b * 100)}％ へ ${Math.abs(Math.round((b - a) * 100))} ポイント動かした。それでも造船量は ${f(r.build)} 万総トンで頭打ちのままだ。船台の数が変わらない以上、鉄をいくら回しても組める船は増えない。動かしているものと、効いているものが違う。`,
+        alert: true,
+      };
+    }
+  }
+
+  /* 前線が崩れている */
+  if (r.strain > 1.02) {
+    const pct = Math.round((r.strain - 1) * 100);
+    return {
+      tag: "前線",
+      head: "造船に寄せた鉄が、沈没量に化けている",
+      body: `兵器に回した鉄は ${f(r.weapon)} 万トン。前線の維持に要る 60 万トンを ${f(60 - r.weapon)} 万トン 下回っている。護衛と制空権が失われ、損耗率が ${pct}％ 増しになった。この期に沈んだ ${f(r.loss)} 万総トンのうち、およそ ${f(r.loss - r.loss / r.strain)} 万総トンは配分を寄せたことの代償だ。`,
+      alert: true,
+    };
+  }
+
+  /* 鉄鋼生産が上限を割った初回 */
+  if (r.steelBefore < 154.5 && prev && prev.steelBefore >= 154.5) {
+    return {
+      tag: "鉄鋼",
+      head: "輪が、鉄にまで及んだ",
+      body: `鉄鋼の生産可能量が設備能力の上限 155 万トン を割り、${f(r.steelBefore)} 万トンになった。設備が壊れたのではない。船腹が ${f(r.T0)} 万総トンまで減り、鉄鉱石と石炭を運びきれなくなったからだ。これまで独立に見えていた鉄が、船の減少に引きずられ始めた。`,
+      alert: true,
+    };
+  }
+
+  /* 損耗率が跳ねた */
+  if (prev) {
+    const now = r.lossRate * 100, was = prev.lossRate * 100;
+    if (now - was > 1.5) {
+      return {
+        tag: "損耗",
+        head: "損耗率が段を上がった",
+        body: `前期 ${f(was)}％ だった損耗率が、今期は ${f(now)}％ に跳ねた。緩やかに増えているのではなく、段差で上がっている。直前の値をそのまま次期に置くと、こういう期で必ず低く外す。推計では率そのものの傾きを見なければならない。`,
+      };
+    }
+  }
+
+  /* 初回 */
+  if (turn === 0) {
+    return {
+      tag: "初期",
+      head: "初期配分でも、すでに差引は負である",
+      body: `開戦の期から、造れた船 ${f(r.build)} 万総トン に対して沈んだ船が ${f(r.loss)} 万総トン。差引 ${r.delta > 0 ? "＋" : "−"}${f(Math.abs(r.delta))} 万総トン。輪はもう逆向きに回り始めている。あなたの仕事は、これを止めることではなく、いつどこで限界が来るかを見極めることになる。`,
+      alert: r.delta < 0,
+    };
+  }
+
+  /* 船台の能力が上がった期 */
+  if (prev && r.yardCap > prev.yardCap && fresh("船台")) {
+    return {
+      tag: "船台",
+      head: "船台は増えた。それでも追いつかない",
+      body: `造船所の能力が前期の ${f(prev.yardCap)} 万総トン から ${f(r.yardCap)} 万総トン へ上がった。増産の努力そのものは実っている。だが同じ期の喪失は ${f(r.loss)} 万総トン。造る側の改善が、沈む側の増加に追い越されている。増産で解ける問題ではないことが、この二つの数字の並びに出ている。`,
+      alert: true,
+    };
+  }
+
+  /* 石油の残存期間（初出のみ） */
+  const net = r.oilOut - r.oilIn;
+  if (net > 0 && fresh("石油")) {
+    const q = r.O / net;
+    return {
+      tag: "石油",
+      head: "石油の残りを、期数に直しておく",
+      body: `今期の還送は ${f(r.oilIn)} 万kl、消費は ${f(r.oilOut)} 万kl。差し引き ${f(net)} 万kl の持ち出しだ。残高 ${f(r.O)} 万kl をこの速さで割ると、あと ${q.toFixed(1)} 期。ただし船腹が減れば還送も落ちるので、実際にはこれより短くなる。`,
+    };
+  }
+
+  /* 還送の頭打ち（輸送力が南方の生産に追いつかない） */
+  if (r.capacity < r.oilIn * 1.02 + 0.01 && fresh("輸送")) {
+    return {
+      tag: "輸送",
+      head: "油田は動いている。運ぶ船が足りない",
+      body: `南方の生産能力に対し、運べる量は ${f(r.capacity)} 万kl が限界だ。掘れる量ではなく、船腹が石油の流入を決めている。産油地を確保しても、タンカーが沈めば同じことになる。占領の成果が、輸送力の不足で相殺されている。`,
+      alert: true,
+    };
+  }
+
+  /* 累積の目減り（初出のみ） */
+  const lost = ((630 - r.T) / 630) * 100;
+  if (fresh("船腹")) {
+    return {
+      tag: "船腹",
+      head: "開戦時からの目減り",
+      body: `船腹は ${f(r.T)} 万総トン。開戦時の 630 万総トン から ${lost.toFixed(1)}％ が失われた。ここまでの ${turn + 1} 期で沈んだ合計は ${f(rows.slice(0, turn + 1).reduce((a, x) => a + x.loss, 0))} 万総トン、造れた合計は ${f(rows.slice(0, turn + 1).reduce((a, x) => a + x.build, 0))} 万総トン。二つの数字の開きが、そのまま輪の回る速さだ。`,
+    };
+  }
+
+  /* 最後の砦 */
+  return {
+    tag: "累計",
+    head: "帳簿は同じ向きを指し続けている",
+    body: `${turn + 1} 期にわたって差引は負のままだ。今期は ${r.delta > 0 ? "＋" : "−"}${f(Math.abs(r.delta))} 万総トン。配分をどこに置いても符号は変わらない。変えられるのは速さだけで、向きではない。`,
+    alert: true,
+  };
+}
+
+function remark2026({ rows, turn, credit, lockTurn, shipSteel }) {
+  const r = rows[turn];
+  const f = (x, d = 1) => x.toFixed(d);
+  const open = Object.keys(lockTurn).length;
+
+  /* 最適配分の位置 */
+  const { best, worst } = solveBestAllocation(lockTurn);
+  const mine = survivalMonths({ shipSteel, lockTurn });
+
+  if (open === 0 && credit >= 30) {
+    return {
+      tag: "前提",
+      head: "信用が基準を越えた。使うかどうかはあなたが決める",
+      body: `信用 ${credit} / 100。海上護衛の優先を議題に載せられる。配分を最適点に合わせても最悪点との差は ${(best.m - worst.m).toFixed(1)} ヶ月だが、この一つを通せば単位が変わる。効き目の大きさは、感度分析の帯の長さがそのまま示している。`,
+      alert: true,
+    };
+  }
+  if (open > 0 && Math.abs(mine - best.m) < 0.15) {
+    return {
+      tag: "最適",
+      head: "いまの配分は最適点にある",
+      body: `86通りのどれよりも長く保つ配分だ。ただし最悪の配分との差は ${(best.m - worst.m).toFixed(1)} ヶ月にすぎない。あなたがすでに解除した前提条件は、それより桁の大きい効果を出している。どちらに時間を使うべきかは、この二つの数字が答えている。`,
+    };
+  }
+  if (turn >= 1) {
+    return {
+      tag: "検証",
+      head: "答え合わせが積み上がっている",
+      body: `信用 ${credit} / 100。1941年のあなたは、何期出しても 20 / 100 のままだった。違いは分析の質ではない。予測が四半期ごとに検証される仕組みがあるかどうかだけだ。`,
+    };
+  }
+  return {
+    tag: "開始",
+    head: "同じ盤面、同じ数字",
+    body: `船腹 ${Math.round(r.T0)} 万総トン、石油 840 万kl。一周目とまったく同じ位置から始まっている。変わったのは道具だけだ。`,
+  };
+}
+
+function Remark({ era, data }) {
+  const [open, setOpen] = useState(true);
+  const dark = era !== 1941;
+  const acc = data.alert ? (dark ? P26.amber : P41.red) : (dark ? P26.cyan : P41.ink);
+
+  return (
+    <div className="mb-6" style={{
+      background: dark ? P26.panel : P41.paper,
+      border: `1px solid ${data.alert ? acc : (dark ? P26.line : P41.rule)}`,
+      borderLeft: `3px solid ${acc}`,
+    }}>
+      <button onClick={() => setOpen(!open)} className="w-full text-left px-4 py-3">
+        <div className="flex items-baseline justify-between">
+          <span style={{ color: dark ? P26.dim : P41.ink3, fontSize: 9, letterSpacing: "0.3em" }}>
+            所見 — {data.tag}
+          </span>
+          <span style={{ color: dark ? P26.dim : P41.ink3, fontSize: 10 }}>{open ? "▾" : "▸"}</span>
+        </div>
+        <div style={{
+          color: acc, fontSize: 14, lineHeight: 1.6, marginTop: 4,
+          fontFamily: dark ? "inherit" : "serif",
+        }}>
+          {data.head}
+        </div>
+      </button>
+      {open && (
+        <p className="px-4 pb-4" style={{
+          color: dark ? P26.text : P41.ink2, fontSize: 12, lineHeight: 2,
+        }}>
+          {data.body}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/* =========================================================================
    期の切り替え — 「期が進んだ」を身体で分からせる
    ========================================================================= */
 
@@ -972,8 +1319,17 @@ const KEYFRAMES = `
 @keyframes vp-veil    { from { opacity: 0 } to { opacity: 1 } }
 @keyframes vp-scan    { from { transform: translateY(-110%) } to { transform: translateY(110%) } }
 @keyframes vp-tick    { 0%,100% { opacity: 1 } 50% { opacity: 0.25 } }
+@keyframes vp-pulse-ink  { 0%,100% { box-shadow: 0 0 0 0 rgba(34,44,74,0.00) }
+                           50%     { box-shadow: 0 0 0 5px rgba(34,44,74,0.18) } }
+@keyframes vp-pulse-cyan { 0%,100% { box-shadow: 0 0 0 0 rgba(56,214,224,0.00) }
+                           50%     { box-shadow: 0 0 0 5px rgba(56,214,224,0.22) } }
+@keyframes vp-nudge   { 0%,100% { transform: translateY(0) } 50% { transform: translateY(3px) } }
 @media (prefers-reduced-motion: reduce) {
-  [class^="vp-"], [class*=" vp-"] { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important }
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }
 `;
 
@@ -1101,6 +1457,95 @@ function TurnTransition({ era, toTurn, notes, credit, onDone }) {
 }
 
 /* =========================================================================
+   操作の所在を示す
+   ========================================================================= */
+
+function ActionPanel({ era, id, n, title, hint, active, done, optional, children }) {
+  const dark = era !== 1941;
+  const acc = dark ? P26.cyan : P41.ink;
+  const bg = dark ? P26.panel : P41.paper;
+  const line = dark ? P26.line : P41.rule;
+  const sub = dark ? P26.dim : P41.ink3;
+
+  return (
+    <div id={id} className="mb-6" style={{
+      background: bg,
+      border: `${active ? 2 : 1}px solid ${active ? acc : line}`,
+      animation: active ? `${dark ? "vp-pulse-cyan" : "vp-pulse-ink"} 2.4s ease-in-out infinite` : "none",
+    }}>
+      <div className="px-4 pt-4 pb-3 flex items-start gap-3">
+        <span className="shrink-0 flex items-center justify-center" style={{
+          width: 24, height: 24,
+          background: done ? "transparent" : acc,
+          border: done ? `1px solid ${sub}` : "none",
+          color: done ? sub : (dark ? "#04202a" : P41.paper),
+          fontSize: 12, fontFamily: "ui-monospace, monospace",
+        }}>
+          {done ? "✓" : n}
+        </span>
+        <div className="flex-1">
+          <div className="flex items-baseline gap-2 flex-wrap">
+            <span style={{ color: dark ? P26.text : P41.ink, fontSize: 14 }}>{title}</span>
+            <span style={{
+              color: optional ? sub : acc, fontSize: 9, letterSpacing: "0.2em",
+              border: `1px solid ${optional ? sub : acc}`, padding: "1px 5px",
+            }}>
+              {optional ? "任意" : "操作"}
+            </span>
+          </div>
+          {hint && (
+            <div style={{ color: sub, fontSize: 10, lineHeight: 1.7, marginTop: 3 }}>{hint}</div>
+          )}
+        </div>
+      </div>
+      <div className="px-4 pb-4">{children}</div>
+    </div>
+  );
+}
+
+/* 画面下に貼りつく行動バー */
+function ActionBar({ era, label, targetId, cta, onCta }) {
+  const dark = era !== 1941;
+  const acc = dark ? P26.cyan : P41.ink;
+  const bg = dark ? P26.panel : P41.paper;
+  const line = dark ? P26.line : P41.rule;
+
+  const jump = () => {
+    if (onCta) return onCta();
+    const el = typeof document !== "undefined" && document.getElementById(targetId);
+    if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+  };
+
+  return (
+    <div className="fixed inset-x-0 bottom-0" style={{ zIndex: 35 }}>
+      <div className="mx-auto flex items-center gap-3 px-4 py-3" style={{
+        maxWidth: 672, background: bg, borderTop: `2px solid ${acc}`,
+        boxShadow: dark ? "0 -8px 24px rgba(0,0,0,0.5)" : "0 -8px 24px rgba(90,80,60,0.18)",
+      }}>
+        <div className="flex-1 min-w-0">
+          <div style={{ color: dark ? P26.dim : P41.ink3, fontSize: 9, letterSpacing: "0.3em" }}>
+            次にすること
+          </div>
+          <div style={{
+            color: dark ? P26.text : P41.ink, fontSize: 13, lineHeight: 1.5,
+            overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+          }}>
+            {label}
+          </div>
+        </div>
+        <button onClick={jump} className="shrink-0 px-4 py-2 flex items-center gap-2" style={{
+          background: acc, color: dark ? "#04202a" : P41.paper,
+          fontSize: 12, letterSpacing: "0.1em",
+        }}>
+          {cta || "その場所へ"}
+          {!cta && <span style={{ animation: "vp-nudge 1.6s ease-in-out infinite" }}>▾</span>}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* =========================================================================
    任務バー — 「いま何をしているのか」を常に画面に置く
    ========================================================================= */
 
@@ -1189,6 +1634,9 @@ function Lens1941({ onDone }) {
   const [seen, setSeen] = useState({});
   const [trans, setTrans] = useState(null);
   const [est, setEst] = useState(null);
+  const [allocLog, setAllocLog] = useState([]);
+  const [usedTags, setUsedTags] = useState([]);
+  const [touched, setTouched] = useState(false);
 
   const sim = useMemo(() => simulate({ shipSteel, turns: TURNS }), [shipSteel]);
   const rows = sim.rows.slice(0, turn + 1);
@@ -1202,7 +1650,9 @@ function Lens1941({ onDone }) {
 
   const submitPred = (band, conf) => {
     setPreds((p) => [...p, { turn, band, conf, resolved: false }]);
+    setAllocLog((a) => [...a, shipSteel]);
     setPending(null);
+    setTouched(false);
     if (turn + 1 < TURNS) {
       const r = sim.rows[turn];
       setTrans({
@@ -1220,6 +1670,13 @@ function Lens1941({ onDone }) {
   };
 
   const flipped = cur && cur.delta < 0;
+  const rem = useMemo(
+    () => remark1941({ rows: sim.rows, turn, allocLog, used: usedTags }),
+    [sim, turn, allocLog, usedTags]
+  );
+  useEffect(() => {
+    if (rem && !usedTags.includes(rem.tag)) setUsedTags((u) => [...u, rem.tag]);
+  }, [turn]);
 
   if (trans) {
     return (
@@ -1303,10 +1760,18 @@ function Lens1941({ onDone }) {
             <thead>
               <tr style={{ borderBottom: `2px solid ${P41.ink}` }}>
                 {[["期", ""], ["船腹", "輸送船の総量"], ["造船", "新しく造れた分"],
-                  ["喪失", "沈められた分"], ["差引", "増減"], ["石油", "残っている量"], ["鉄鋼", "造れる量"]].map(([h, sub]) => (
+                  ["喪失", "沈められた分"], ["差引", "増減"], ["石油", "残っている量"], ["鉄鋼", "造れる量"]].map(([h, sub], hi) => (
                   <th key={h} className="px-2 py-2" style={{ color: P41.ink, fontWeight: 400, fontSize: 10, letterSpacing: "0.1em" }}>
                     <div>{h === "船腹" ? <T>船腹</T> : h}</div>
                     {sub && <div style={{ color: P41.ink3, fontSize: 8, fontWeight: 400, letterSpacing: 0 }}>{sub}</div>}
+                    {hi > 0 && (
+                      <div style={{
+                        color: hi <= 4 ? P41.ink2 : P41.ink3,
+                        fontSize: 8, fontWeight: 400, letterSpacing: 0,
+                      }}>
+                        {hi <= 4 ? "万総トン" : hi === 5 ? "万kl" : "万トン"}
+                      </div>
+                    )}
                   </th>
                 ))}
               </tr>
@@ -1322,15 +1787,18 @@ function Lens1941({ onDone }) {
                     <Num v={r.delta} digits={1} color={r.delta < 0 ? P41.red : P41.ink} />
                   </td>
                   <td className="px-2 py-2 text-right"><Num v={r.O} color={P41.ink} /></td>
-                  <td className="px-2 py-2 text-right"><Num v={r.steel} color={P41.ink2} /></td>
+                  <td className="px-2 py-2 text-right"><Num v={r.steelBefore} color={P41.ink2} /></td>
                 </tr>
               ))}
             </tbody>
           </table>
           <div className="px-2 py-1" style={{ color: P41.ink3, fontSize: 9 }}>
-            単位 — 船の量は<T>万総トン</T>（1万総トンで大型貨物船1〜2隻分）、石油は<T>万kl</T>、鉄鋼は万トン
+            <b>船腹・造船・喪失・差引</b> はいずれも <T>万総トン</T>（船の大きさの単位。1万総トンで大型貨物船1〜2隻分）。
+            石油は <T>万kl</T>、<T>鉄鋼</T> は万トン（その期に生産できる量）。
           </div>
         </div>
+
+        <Remark era={1941} data={rem} />
 
         {flipped && !notedFlip && (
           <div className="mb-6 p-4" style={{ border: `2px solid ${P41.red}`, background: P41.paper }}>
@@ -1358,13 +1826,9 @@ function Lens1941({ onDone }) {
         )}
 
         {/* 唯一のレバー */}
-        <div className="mb-6 p-4" style={{ background: P41.paper, border: `1px solid ${P41.rule}` }}>
-          <div className="mb-3">
-            <div style={{ color: P41.ink, fontSize: 13 }}>鉄鋼の配分</div>
-            <div style={{ color: P41.ink3, fontSize: 10, lineHeight: 1.7 }}>
-              限られた鉄を、船に回すか、兵器に回すか。あなたが自分の判断で動かせるのはこの一つだけ。
-            </div>
-          </div>
+        <ActionPanel era={1941} id="alloc" n="1" title="鉄鋼の配分を決める"
+          hint="限られた鉄を、船に回すか、兵器に回すか。あなたが自分の判断で動かせるのはこの一つだけ。"
+          active={!touched && !pending} done={touched}>
           <div className="flex items-baseline justify-between mb-2">
             <span style={{ color: P41.ink3, fontSize: 10 }}>船 ← → 兵器</span>
             <span style={{ color: P41.ink2, fontSize: 11, fontFamily: "ui-monospace, monospace" }}>
@@ -1372,14 +1836,19 @@ function Lens1941({ onDone }) {
             </span>
           </div>
           <input type="range" min="0.05" max="0.9" step="0.05" value={shipSteel}
-            onChange={(e) => setShipSteel(parseFloat(e.target.value))}
+            onChange={(e) => { setShipSteel(Math.round(parseFloat(e.target.value) * 100) / 100); setTouched(true); }}
             className="w-full" style={{ accentColor: P41.ink }} />
+          <div className="flex justify-between mt-1" style={{ color: P41.ink3, fontSize: 9 }}>
+            <span>5％</span>
+            <span>算盤で扱えるのは五分刻みまで</span>
+            <span>90％</span>
+          </div>
           <p className="mt-2" style={{ color: P41.ink3, fontSize: 10, lineHeight: 1.8 }}>
             造船に回せば船は増えるが、<T>船台</T>（船を組み立てる台）の数に限りがあるため天井がある。
             兵器を削りすぎれば前線が崩れ、船はかえって多く沈む。
           </p>
           <SteelMath era={1941} row={cur} shipSteel={shipSteel} />
-        </div>
+        </ActionPanel>
 
         {/* 試算 — 二期目から */}
         {turn >= 1 && !seen.whatif && (
@@ -1388,16 +1857,9 @@ function Lens1941({ onDone }) {
             onClose={() => setSeen((x) => ({ ...x, whatif: true }))} />
         )}
         {turn >= 1 && (
-        <div className="mb-6 p-4" style={{ background: P41.paper, border: `1px solid ${P41.rule}` }}>
-          <div className="mb-3">
-            <div className="flex items-baseline justify-between">
-              <span style={{ color: P41.ink, fontSize: 13 }}>試算</span>
-              <span style={{ color: P41.ink2, fontSize: 11 }}>残り {whatIfLeft} 回</span>
-            </div>
-            <div style={{ color: P41.ink3, fontSize: 10, lineHeight: 1.7 }}>
-              その配分のまま終戦まで通したら、石油はいつ尽きるか。一件に数週間かかる。
-            </div>
-          </div>
+        <ActionPanel era={1941} id="whatif" n="＊" optional
+          title={`試算する（残り ${whatIfLeft} 回）`}
+          hint="その配分のまま終戦まで通したら、石油はいつ尽きるか。一件に数週間かかる。">
           {computing !== false ? (
             <AbacusWork value={computing}
               onDone={() => {
@@ -1426,7 +1888,7 @@ function Lens1941({ onDone }) {
               ))}
             </div>
           )}
-        </div>
+        </ActionPanel>
         )}
 
         {/* 前提条件 — 差引が負に転じてから、または四期目から */}
@@ -1436,25 +1898,30 @@ function Lens1941({ onDone }) {
             onClose={() => setSeen((x) => ({ ...x, locks: true }))} />
         )}
         {(notedFlip || turn >= 3) && (
-        <div className="mb-6 p-4" style={{ background: P41.paper, border: `1px solid ${P41.rule}` }}>
+        <ActionPanel era={1941} id="locks" n="＊" optional title="前提条件を見る"
+          hint="動かせないことになっているもの。信用が基準に達すれば議題に載せられる。">
           <LockPanel era={1941} credit={20} lockTurn={{}} turn={turn} onUnlock={() => {}} />
           <p className="mt-3" style={{ color: P41.ink3, fontSize: 10, lineHeight: 1.8 }}>
             どれも「信用」が足りず、議題に載せられない。あなたの予測は、まだ一度も答え合わせをされていないからだ。
             当たったかどうかが分かるのは、決定が下されたずっと後になる。
           </p>
-        </div>
+        </ActionPanel>
         )}
 
         {/* 予測提出 */}
-        {!pending ? (
-          <button onClick={() => setPending({})} className="w-full px-6 py-4"
-            style={{ background: P41.ink, color: P41.paper, letterSpacing: "0.2em", fontSize: 13 }}>
-            次の四半期の見通しを書いて、帳簿を締める
-          </button>
-        ) : (
-          <PredForm era={1941} onSubmit={submitPred} suggested={est}
-            basis={<Estimate1941 rows={sim.rows} turn={turn} onEstimate={(k) => setEst(k)} />} />
-        )}
+        <ActionPanel era={1941} id="submit" n="2" title="次の四半期の見通しを出す"
+          hint="推計盤で次期の喪失量を見積もり、確信度を添えて提出する。提出すると期が進む。"
+          active={touched && !pending}>
+          {!pending ? (
+            <button onClick={() => setPending({})} className="w-full px-6 py-4"
+              style={{ background: P41.ink, color: P41.paper, letterSpacing: "0.2em", fontSize: 13 }}>
+              推計盤をひらく
+            </button>
+          ) : (
+            <PredForm era={1941} onSubmit={submitPred} suggested={est}
+              basis={<Estimate1941 rows={sim.rows} turn={turn} onEstimate={(k) => setEst(k)} />} />
+          )}
+        </ActionPanel>
 
         <div className="mt-4 flex items-center justify-between">
           <span style={{ color: P41.ink3, fontSize: 10 }}>{turn + 1} / {TURNS} 期</span>
@@ -1463,6 +1930,12 @@ function Lens1941({ onDone }) {
           </button>
         </div>
       </div>
+
+      {!pending && (
+        <ActionBar era={1941}
+          label={touched ? "② 次の四半期の見通しを出す" : "① 鉄鋼の配分を決める"}
+          targetId={touched ? "submit" : "alloc"} />
+      )}
     </div>
   );
 }
@@ -1489,8 +1962,11 @@ function Estimate1941({ rows, turn, onEstimate }) {
       <table className="w-full mb-3" style={{ fontSize: 11, borderCollapse: "collapse" }}>
         <thead>
           <tr style={{ borderBottom: `1px solid ${P41.ink}` }}>
-            {["期", "期首の船腹", "沈んだ量", "損耗率"].map((h) => (
-              <th key={h} className="px-1 py-1" style={{ color: P41.ink3, fontWeight: 400, fontSize: 9 }}>{h}</th>
+            {[["期", ""], ["期首の船腹", "万総トン"], ["沈んだ量", "万総トン"], ["損耗率", "％"]].map(([h, u]) => (
+              <th key={h} className="px-1 py-1" style={{ color: P41.ink3, fontWeight: 400, fontSize: 9 }}>
+                <div>{h}</div>
+                {u && <div style={{ fontSize: 7 }}>{u}</div>}
+              </th>
             ))}
           </tr>
         </thead>
@@ -1528,14 +2004,15 @@ function Estimate1941({ rows, turn, onEstimate }) {
       <Formula era={1941} lines={[
         { t: `期末の船腹     ${startT.toFixed(1)} 万総トン` },
         { t: `置いた損耗率   ${rate.toFixed(1)}％` },
-        { t: `予想喪失 = ${startT.toFixed(1)} × ${rate.toFixed(1)}％ = ${est.toFixed(1)} 万総トン`, hi: true },
+        { t: `予想喪失 = ${startT.toFixed(1)} 万総トン × ${rate.toFixed(1)}％`, hi: true },
+        { t: `         = ${est.toFixed(1)} 万総トン`, hi: true },
         { t: `→ ${band.l41}`, hi: true },
       ]} />
     </div>
   );
 }
 
-/* ---------- 2026: 模型による推定 ---------- */
+/* ---------- 2026: 数理モデルによる推定 ---------- */
 function Estimate2026({ shipSteel, lockTurn, turn, onEstimate }) {
   const dist = useMemo(() => {
     const xs = [];
@@ -1561,7 +2038,7 @@ function Estimate2026({ shipSteel, lockTurn, turn, onEstimate }) {
     <div className="mb-4">
       <div style={{ color: P26.text, fontSize: 12 }} className="mb-1">推定</div>
       <p style={{ color: P26.dim, fontSize: 10, lineHeight: 1.8 }} className="mb-3">
-        現在の配分と前提条件のもとで次期を{dist.n}回試行した。模型が出した各範囲の確率は以下。
+        現在の配分と前提条件のもとで次期を{dist.n}回試行した。数理モデルが出した各範囲の確率は以下。
       </p>
       <div className="space-y-2 mb-3">
         {BANDS.map((b) => {
@@ -1584,12 +2061,22 @@ function Estimate2026({ shipSteel, lockTurn, turn, onEstimate }) {
       </div>
       <Formula era={2026} lines={[
         { t: `中央値       ${dist.p50.toFixed(1)} 万総トン` },
-        { t: `90％の範囲   ${dist.p05.toFixed(1)} 〜 ${dist.p95.toFixed(1)}`, hi: true },
+        { t: `90％の範囲   ${dist.p05.toFixed(1)} 〜 ${dist.p95.toFixed(1)} 万総トン`, hi: true },
       ]} />
-      <p className="mt-2" style={{ color: P26.dim, fontSize: 10, lineHeight: 1.8 }}>
-        模型が {(dist.probs[best.key] * 100).toFixed(0)}％ と言っているとき、あなたが 95％ と申告する根拠はあるか。
-        確信度は、この数字に合わせるのが<T>較正</T>の基本になる。
-      </p>
+      <div className="mt-3 px-3 py-3" style={{ border: `1px solid ${P26.line}`, background: P26.panel2 }}>
+        <div style={{ color: P26.cyan, fontSize: 11, fontWeight: 700, letterSpacing: "0.05em" }} className="mb-2">
+          確信度は {(dist.probs[best.key] * 100).toFixed(0)}％ と申告することを勧める
+        </div>
+        <p style={{ color: P26.text, fontSize: 11, lineHeight: 1.9 }}>
+          数理モデルがこの範囲を {(dist.probs[best.key] * 100).toFixed(0)}％ と算出している。
+          確信度は、この確率にそのまま合わせるのが<T>較正</T>の基本だ。
+        </p>
+        <p className="mt-2" style={{ color: P26.dim, fontSize: 10, lineHeight: 1.9 }}>
+          これより高く申告してよいのは、モデルが織り込んでいない事情を自分が知っている場合だけ。
+          根拠なく上乗せした分は、そのまま較正の悪化として記録に残る。
+          低く申告した場合も同じで、当てても信用は小さくしか増えない。
+        </p>
+      </div>
     </div>
   );
 }
@@ -1639,8 +2126,10 @@ function PredForm({ era, onSubmit, basis, suggested, modelProb }) {
           border: `1px solid ${era === 1941 ? P41.red : P26.amber}`,
           color: era === 1941 ? P41.red : P26.amber, fontSize: 10, lineHeight: 1.8,
         }}>
-          模型はこの範囲を {(modelProb[band] * 100).toFixed(0)}％ と見ている。
-          それを {conf}％ と申告するのは、模型より自分を信じるということだ。外れれば信用は大きく減る。
+          <b>推奨は {(modelProb[band] * 100).toFixed(0)}％ です。</b>
+          いまの申告 {conf}％ は、数理モデルの算出より {(conf - modelProb[band] * 100).toFixed(0)} ポイント高い。
+          モデルが見落としている事情を掴んでいるなら、そのまま出してよい。
+          そうでなければ {(modelProb[band] * 100).toFixed(0)}％ へ下げることを勧める。
         </p>
       )}
       <button disabled={!band} onClick={() => band && onSubmit(band, conf)} className="w-full px-6 py-3"
@@ -1789,8 +2278,8 @@ function Petition({ era, credit, lockTurn, breach, onDone }) {
 
         {!loading && (
           <div className="mt-10">
-            <div className="text-center mb-8">
-              <Stamp text={passed ? "決 裁" : "却 下"}
+            <div className="mb-8">
+              <StampOnView text={passed ? "決 裁" : "却 下"}
                 color={passed ? (era === 1941 ? P41.ink : P26.cyan) : (era === 1941 ? P41.red : P26.red)} />
             </div>
             <button onClick={() => onDone(passed)} className="w-full px-6 py-4"
@@ -1971,6 +2460,102 @@ function Tornado({ shipSteel, lockTurn }) {
   );
 }
 
+function Optimizer({ shipSteel, lockTurn, onApply }) {
+  const { scan, best, worst } = useMemo(() => solveBestAllocation(lockTurn), [JSON.stringify(lockTurn)]);
+  const mine = survivalMonths({ shipSteel, lockTurn });
+  const gap = best.m - mine;
+  const atBest = Math.round(shipSteel * 100) === Math.round(best.ss * 100);
+
+  const W = 300, H = 96, PAD = 6;
+  const lo = worst.m, hi = best.m, span = Math.max(hi - lo, 0.001);
+  const x = (ss) => PAD + ((ss - 0.05) / 0.85) * (W - PAD * 2);
+  const y = (m) => H - PAD - ((m - lo) / span) * (H - PAD * 2 - 10);
+
+  const fmt = (m) => `${Math.floor(m / 12)}年${Math.round(m % 12)}ヶ月`;
+
+  return (
+    <div>
+      <p style={{ color: P26.dim, fontSize: 10, lineHeight: 1.8 }} className="mb-3">
+        造船配分を 5％ 刻みで総当たりし、石油が尽きるまでの期間が最も長くなる点を探した。86通りを一巡している。
+      </p>
+
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ background: P26.panel2 }}>
+        <polyline fill="none" stroke={P26.cyan} strokeWidth="1.4" opacity="0.9"
+          points={scan.filter((_, i) => i % 2 === 0).map((p) => `${x(p.ss)},${y(p.m)}`).join(" ")} />
+        <line x1={x(best.ss)} y1={PAD} x2={x(best.ss)} y2={H - PAD}
+          stroke={P26.cyan} strokeWidth="0.8" strokeDasharray="3 3" />
+        <circle cx={x(best.ss)} cy={y(best.m)} r="4" fill={P26.cyan} />
+        <text x={x(best.ss)} y={y(best.m) - 8} textAnchor="middle" fill={P26.cyan} fontSize="8">
+          最適 {Math.round(best.ss * 100)}％
+        </text>
+        <circle cx={x(shipSteel)} cy={y(mine)} r="4.5" fill="none"
+          stroke={atBest ? P26.cyan : P26.amber} strokeWidth="2" />
+        {!atBest && (
+          <text x={x(shipSteel)} y={y(mine) + 14} textAnchor="middle" fill={P26.amber} fontSize="8">
+            いまの配分
+          </text>
+        )}
+      </svg>
+      <div className="flex justify-between mt-1" style={{ color: P26.dim, fontSize: 9 }}>
+        <span>造船 5％</span><span>造船 90％</span>
+      </div>
+
+      <div className="mt-3 p-3" style={{
+        background: P26.panel2,
+        border: `1px solid ${atBest ? P26.cyan : P26.line}`,
+      }}>
+        {atBest ? (
+          <>
+            <div style={{ color: P26.cyan, fontSize: 15, letterSpacing: "0.1em" }} className="mb-1">
+              ◆ 最適配分に到達
+            </div>
+            <p style={{ color: P26.text, fontSize: 11, lineHeight: 1.9 }}>
+              造船 {Math.round(best.ss * 100)}％、持ちこたえ {fmt(best.m)}。86通りのどれよりも長く保つ配分だ。
+              船を増やす効果と、兵器を削って前線が崩れる損失が、ちょうど釣り合う点にある。
+              端に寄せた配分（造船 {Math.round(worst.ss * 100)}％、{fmt(worst.m)}）より {(best.m - worst.m).toFixed(1)} ヶ月ぶん有利。
+            </p>
+            <p className="mt-2" style={{ color: P26.amber, fontSize: 11, lineHeight: 1.9 }}>
+              ただし、これで持ちこたえるのは {fmt(best.m)}。最善を尽くしてなお、この長さにしかならない。
+            </p>
+          </>
+        ) : (
+          <>
+            <div className="flex justify-between items-baseline mb-2">
+              <span style={{ color: P26.dim, fontSize: 11 }}>いまの配分 {Math.round(shipSteel * 100)}％</span>
+              <span style={{ color: P26.text, fontFamily: "ui-monospace, monospace", fontSize: 15 }}>{fmt(mine)}</span>
+            </div>
+            <div className="flex justify-between items-baseline mb-2">
+              <span style={{ color: P26.cyan, fontSize: 11 }}>最適 {Math.round(best.ss * 100)}％</span>
+              <span style={{ color: P26.cyan, fontFamily: "ui-monospace, monospace", fontSize: 15 }}>{fmt(best.m)}</span>
+            </div>
+            <div style={{ color: P26.amber, fontSize: 11, lineHeight: 1.8 }}>
+              あと {gap.toFixed(1)} ヶ月ぶん、伸ばす余地がある。
+            </div>
+            <button onClick={() => onApply(best.ss)} className="mt-3 w-full px-4 py-2"
+              style={{ background: P26.cyan, color: "#04202a", fontSize: 11, letterSpacing: "0.15em" }}>
+              最適配分を適用する
+            </button>
+          </>
+        )}
+      </div>
+
+      {Object.keys(lockTurn).length > 0 && (
+        <p className="mt-3 px-3 py-2" style={{
+          border: `1px dashed ${P26.amber}`, color: P26.amber, fontSize: 10, lineHeight: 1.9,
+        }}>
+          前提条件を解除したので、曲線そのものが描き直されている。
+          最適点は 造船 {Math.round(best.ss * 100)}％ へ移った。
+          制約が動けば最適解も動く。一度解いて終わりにはならない。
+        </p>
+      )}
+      <p className="mt-3" style={{ color: P26.dim, fontSize: 10, lineHeight: 1.8 }}>
+        1941年のあなたには、この曲線を描く手段がなかった。試算は三回まで。
+        86点を打つには、算盤で二十年かかる。
+      </p>
+    </div>
+  );
+}
+
 function Lens2026({ onDone }) {
   const TURNS = 8;
   const [shipSteel, setShipSteel] = useState(0.35);
@@ -1985,10 +2570,18 @@ function Lens2026({ onDone }) {
   const [trans, setTrans] = useState(null);
   const [est, setEst] = useState({ key: null, probs: null });
   const [closed, setClosed] = useState(false);
+  const [hailedAt, setHailedAt] = useState(null);
+  const [touched, setTouched] = useState(false);
+  const fmtM = (m) => `${Math.floor(m / 12)}年${Math.round(m % 12)}ヶ月`;
 
   const sim = useMemo(() => simulate({ shipSteel, lockTurn }), [shipSteel, JSON.stringify(lockTurn)]);
   const cur = sim.rows[turn];
   const next = sim.rows[turn + 1];
+  const bestKey = Object.keys(lockTurn).sort().join(",") || "none";
+  const bestInfo = useMemo(() => solveBestAllocation(lockTurn), [bestKey]);
+  const atBest = Math.round(shipSteel * 100) === Math.round(bestInfo.best.ss * 100);
+  const canUnlock = LOCKS.some((L) => lockTurn[L.key] == null && credit >= L.credit
+    && turn >= L.window[0] && turn <= L.window[1]);
 
   const submitPred = (band, conf) => {
     const actual = next ? next.loss : cur.loss;
@@ -1999,6 +2592,7 @@ function Lens2026({ onDone }) {
     setPreds((ps) => [...ps, { turn, band, conf, hit, actual }]);
     setCredit(nc);
     setPending(false);
+    setTouched(false);
     setFeedback({ hit, actual, delta });
   };
 
@@ -2041,6 +2635,53 @@ function Lens2026({ onDone }) {
           step={feedback ? "答え合わせを確認する" : pending ? "次の四半期の見通しを提出する" : credit < 30 ? "予測を当てて信用を貯める" : "前提条件を議題に載せる"}
           credit={credit} submitted={preds.length} resolved={preds.length} />
 
+        {atBest && hailedAt !== bestKey && (
+          <div className="mb-5 p-4" style={{ background: P26.panel, border: `2px solid ${P26.cyan}` }}>
+            <div style={{ color: P26.cyan, fontSize: 10, letterSpacing: "0.25em" }} className="mb-2">
+              総当たり探索の結果
+            </div>
+            <div style={{ color: P26.cyan, fontSize: 19, letterSpacing: "0.06em" }} className="mb-3">
+              ◆ 最適配分に到達
+            </div>
+            <p style={{ color: P26.text, fontSize: 12, lineHeight: 2 }} className="mb-3">
+              造船 {Math.round(bestInfo.best.ss * 100)}％。86通りのどの配分よりも長く保つ点だ。
+              船を増やす効果と、兵器を削って前線が崩れる損失が、ちょうど釣り合っている。
+              手探りで当てられる位置ではない。
+            </p>
+
+            <div className="p-3 mb-3" style={{ background: P26.panel2, border: `1px dashed ${P26.line}` }}>
+              {[
+                ["最適配分での持ちこたえ", fmtM(bestInfo.best.m)],
+                ["最悪配分での持ちこたえ", fmtM(bestInfo.worst.m)],
+                ["最適化で得た差", `${(bestInfo.best.m - bestInfo.worst.m).toFixed(1)} ヶ月`],
+                ["前提条件を一つ動かした場合", "十ヶ月単位で動く"],
+              ].map(([k, v], i) => (
+                <div key={k} className="flex justify-between gap-3" style={{ fontSize: 11, lineHeight: 2 }}>
+                  <span style={{ color: P26.dim }}>{k}</span>
+                  <span style={{
+                    color: i === 3 ? P26.amber : i === 2 ? P26.text : P26.dim,
+                    fontFamily: "ui-monospace, monospace", whiteSpace: "nowrap",
+                  }}>{v}</span>
+                </div>
+              ))}
+            </div>
+
+            <p style={{ color: P26.amber, fontSize: 12, lineHeight: 2 }}>
+              最善を尽くして得たものは {(bestInfo.best.m - bestInfo.worst.m).toFixed(1)} ヶ月だった。
+              あなたが六期にわたって握りしめていたレバーは、
+              <b style={{ color: P26.text }}>正しく握っても大差がつかないレバー</b>だったことになる。
+            </p>
+            <p className="mt-2" style={{ color: P26.dim, fontSize: 11, lineHeight: 1.9 }}>
+              最適化そのものが無意味なのではない。<b style={{ color: P26.text }}>何を最適化するかを選び違えると、
+              正解を出しても盤面が動かない</b>。感度分析の帯の長さは、最初からそれを示していた。
+            </p>
+            <button onClick={() => setHailedAt(bestKey)} className="mt-3 px-4 py-2"
+              style={{ background: P26.cyan, color: "#04202a", fontSize: 11, letterSpacing: "0.15em" }}>
+              受け止める
+            </button>
+          </div>
+        )}
+
         {turn > LOCKS[2].window[1] && lockTurn.withdraw == null && !closed && (
           <div className="mb-5 p-4" style={{ background: P26.panel, border: `2px solid ${P26.red}` }}>
             <div style={{ color: P26.red, fontSize: 10, letterSpacing: "0.25em" }} className="mb-2">
@@ -2052,9 +2693,9 @@ function Lens2026({ onDone }) {
             <div className="p-3 mb-3" style={{ background: P26.panel2, border: `1px dashed ${P26.line}` }}>
               {[
                 ["提起できた期間", `${qShort(0)} 〜 ${qShort(1)} の二期のみ`],
-                ["必要だった信用", "85"],
-                ["その時点のあなたの信用", `${credit <= 36 ? credit : 36} 前後`],
-                ["二期で積める上限", "36"],
+                ["必要だった信用", "85 / 100"],
+                ["その時点のあなたの信用", `${credit <= 36 ? credit : 36} / 100 前後`],
+                ["二期で積める上限", "36 / 100"],
               ].map(([k, v]) => (
                 <div key={k} className="flex justify-between" style={{ fontSize: 11, lineHeight: 2 }}>
                   <span style={{ color: P26.dim }}>{k}</span>
@@ -2064,7 +2705,7 @@ function Lens2026({ onDone }) {
             </div>
             <p style={{ color: P26.text, fontSize: 12, lineHeight: 2 }}>
               モンテカルロも最適化も感度分析も、すべてあなたの手にあった。
-              それでも届かなかった。二期のあいだに 85 まで信用を積む方法は、存在しない。
+              それでも届かなかった。二期のあいだに信用を 85 / 100 まで積む方法は、存在しない。
             </p>
             <p className="mt-2" style={{ color: P26.amber, fontSize: 12, lineHeight: 2 }}>
               最も効く手ほど、最も早い段階で、最も信用が薄いうちに提起しなければならない。
@@ -2124,10 +2765,14 @@ function Lens2026({ onDone }) {
           ))}
         </div>
 
+        <Remark era={2026}
+          data={remark2026({ rows: sim.rows, turn, credit, lockTurn, shipSteel })} />
+
         {/* 解析タブ */}
         <div className="mb-6" style={{ background: P26.panel, border: `1px solid ${P26.line}` }}>
           <div className="flex" style={{ borderBottom: `1px solid ${P26.line}` }}>
-            {[["mc", "モンテカルロ法", "何百通りの未来を試す"], ["sens", "感度分析", "どのレバーが効くか"]].map(([k, l, sub]) => (
+            {[["mc", "モンテカルロ法", "何百通りの未来を試す"], ["sens", "感度分析", "どのレバーが効くか"],
+              ["opt", "最適化", "最も良い配分を解く"]].map(([k, l, sub]) => (
               <button key={k} onClick={() => setTab(k)} className="px-4 py-2 text-left"
                 style={{
                   color: tab === k ? P26.cyan : P26.dim,
@@ -2140,38 +2785,41 @@ function Lens2026({ onDone }) {
             <span className="ml-auto px-3 py-2" style={{ color: P26.dim, fontSize: 9 }}>0.4秒</span>
           </div>
           <div className="p-3">
-            {tab === "mc"
-              ? <MonteCarlo shipSteel={shipSteel} lockTurn={lockTurn} />
-              : <Tornado shipSteel={shipSteel} lockTurn={lockTurn} />}
+            {tab === "mc" ? <MonteCarlo shipSteel={shipSteel} lockTurn={lockTurn} />
+              : tab === "sens" ? <Tornado shipSteel={shipSteel} lockTurn={lockTurn} />
+              : <Optimizer shipSteel={shipSteel} lockTurn={lockTurn} onApply={setShipSteel} />}
           </div>
         </div>
 
         {/* レバー */}
-        <div className="mb-6 p-4" style={{ background: P26.panel, border: `1px solid ${P26.line}` }}>
+        <ActionPanel era={2026} id="alloc" n="1" title="鉄鋼の配分を決める"
+          hint="1％刻みで調整できる。最適化タブが示す点に合わせてもよい。"
+          active={!touched && !pending && !feedback} done={touched}>
           <div className="flex items-baseline justify-between mb-2">
-            <span style={{ color: P26.text, fontSize: 12 }}>鉄鋼の配分</span>
-            <span style={{ color: P26.dim, fontSize: 11, fontFamily: "ui-monospace, monospace" }}>
+            <span style={{ color: P26.dim, fontSize: 11 }}>船 ← → 兵器</span>
+            <span style={{ color: P26.text, fontSize: 12, fontFamily: "ui-monospace, monospace" }}>
               造船 {Math.round(shipSteel * 100)}％
             </span>
           </div>
-          <input type="range" min="0.05" max="0.9" step="0.05" value={shipSteel}
-            onChange={(e) => setShipSteel(parseFloat(e.target.value))}
+          <input type="range" min="0.05" max="0.9" step="0.01" value={shipSteel}
+            onChange={(e) => { setShipSteel(Math.round(parseFloat(e.target.value) * 100) / 100); setTouched(true); }}
             className="w-full" style={{ accentColor: P26.cyan }} />
+          <div className="flex justify-between mt-1" style={{ color: P26.dim, fontSize: 9 }}>
+            <span>5％</span>
+            <span>1％刻みで調整できる</span>
+            <span>90％</span>
+          </div>
           <SteelMath era={2026} row={cur} shipSteel={shipSteel} />
-        </div>
+        </ActionPanel>
 
         {/* ロック */}
-        <div className="mb-6 p-4" style={{ background: P26.panel, border: `1px solid ${P26.line}` }}>
-          <div className="mb-3">
-            <div style={{ color: P26.text, fontSize: 13 }}>前提条件</div>
-            <div style={{ color: P26.dim, fontSize: 10, lineHeight: 1.7 }}>
-              一周目では手が届かなかったもの。信用が基準に達すると議題に載せられる。
-              提起できる期間が過ぎると、二度と開かない。
-            </div>
-          </div>
+        <ActionPanel era={2026} id="locks" n={canUnlock ? "2" : "＊"} optional={!canUnlock}
+          title="前提条件を議題に載せる"
+          hint="一周目では手が届かなかったもの。提起できる期間が過ぎると、二度と開かない。"
+          active={canUnlock && touched && !pending && !feedback}>
           <LockPanel era={2026} credit={credit} lockTurn={lockTurn} turn={turn}
             onUnlock={(k) => setLockTurn((s) => ({ ...s, [k]: turn }))} />
-        </div>
+        </ActionPanel>
 
         {/* 予測 */}
         {feedback ? (
@@ -2192,19 +2840,36 @@ function Lens2026({ onDone }) {
               次期へ
             </button>
           </div>
-        ) : !pending ? (
-          <button onClick={() => setPending(true)} className="w-full px-6 py-4"
-            style={{ background: P26.cyan, color: "#04202a", letterSpacing: "0.2em", fontSize: 13 }}>
-            次期の見通しを提出する
-          </button>
         ) : (
-          <PredForm era={2026} onSubmit={submitPred} suggested={est.key} modelProb={est.probs}
-            basis={<Estimate2026 shipSteel={shipSteel} lockTurn={lockTurn} turn={turn}
-              onEstimate={(key, probs) => setEst({ key, probs })} />} />
+          <ActionPanel era={2026} id="submit" n={canUnlock ? "3" : "2"}
+            title="次期の見通しを提出する"
+            hint="数理モデルの推定を見て、範囲と確信度を申告する。提出すると答え合わせが返る。"
+            active={touched && !pending}>
+            {!pending ? (
+              <button onClick={() => setPending(true)} className="w-full px-6 py-4"
+                style={{ background: P26.cyan, color: "#04202a", letterSpacing: "0.2em", fontSize: 13 }}>
+                推定をひらく
+              </button>
+            ) : (
+              <PredForm era={2026} onSubmit={submitPred} suggested={est.key} modelProb={est.probs}
+                basis={<Estimate2026 shipSteel={shipSteel} lockTurn={lockTurn} turn={turn}
+                  onEstimate={(key, probs) => setEst({ key, probs })} />} />
+            )}
+          </ActionPanel>
         )}
 
-        <div className="mt-4" style={{ color: P26.dim, fontSize: 10 }}>{turn + 1} / {TURNS} 期</div>
+        <div className="mt-4 mb-24" style={{ color: P26.dim, fontSize: 10 }}>{turn + 1} / {TURNS} 期</div>
       </div>
+
+      {!pending && !feedback && (
+        <ActionBar era={2026}
+          label={
+            !touched ? "① 鉄鋼の配分を決める"
+              : canUnlock ? "② 前提条件を議題に載せられる"
+              : "② 次期の見通しを提出する"
+          }
+          targetId={!touched ? "alloc" : canUnlock ? "locks" : "submit"} />
+      )}
     </div>
   );
 }
@@ -2317,7 +2982,43 @@ function Report({ data, onRestart }) {
           </p>
         </Sec>
 
-        <Sec n="02" title="較正 — 自信と的中率は合っていたか">
+        <Sec n="02" title="配分">
+          {(() => {
+            const { best, worst } = solveBestAllocation(lockTurn);
+            const mine = survivalMonths({ shipSteel: r2026.shipSteel, lockTurn });
+            const gap = best.m - mine;
+            const atBest = gap < 0.15;
+            const fmt = (m) => `${Math.floor(m / 12)}年${Math.round(m % 12)}ヶ月`;
+            return (
+              <>
+                <div className="flex justify-between mb-2" style={{ fontSize: 12 }}>
+                  <span style={{ color: P26.dim }}>あなたの配分</span>
+                  <span style={{ color: P26.text, fontFamily: "ui-monospace, monospace" }}>
+                    造船 {Math.round(r2026.shipSteel * 100)}％ / {fmt(mine)}
+                  </span>
+                </div>
+                <div className="flex justify-between mb-3" style={{ fontSize: 12 }}>
+                  <span style={{ color: P26.dim }}>総当たりで求めた最適</span>
+                  <span style={{ color: P26.cyan, fontFamily: "ui-monospace, monospace" }}>
+                    造船 {Math.round(best.ss * 100)}％ / {fmt(best.m)}
+                  </span>
+                </div>
+                <p style={{ color: atBest ? P26.cyan : P26.text, fontSize: 13, lineHeight: 2 }} className="mb-3">
+                  {atBest
+                    ? "あなたは最適点にいた。船を増やす効果と、兵器を削って前線が崩れる損失が釣り合う一点を捉えている。"
+                    : `最適まで ${gap.toFixed(1)} ヶ月の差があった。`}
+                </p>
+                <p style={{ color: P26.amber, fontSize: 12, lineHeight: 2 }}>
+                  ただし、最適配分と最悪の配分の差は {(best.m - worst.m).toFixed(1)} ヶ月しかない。
+                  一方、前提条件を一つ動かせば数四半期——十ヶ月単位で動く。
+                  <span style={{ color: P26.text }}>握りしめていたレバーは、正しく握っても大差がつかないレバーだった。</span>
+                </p>
+              </>
+            );
+          })()}
+        </Sec>
+
+        <Sec n="03" title="較正 — 自信と的中率は合っていたか">
           {buckets.length ? (
             <div className="space-y-3">
               {buckets.map((b) => (
@@ -2341,14 +3042,14 @@ function Report({ data, onRestart }) {
               ))}
               <p style={{ color: P26.dim, fontSize: 10, lineHeight: 1.9 }}>
                 薄い帯が「あなたが言った自信の高さ」、濃い帯が「実際に当たった割合」。
-                二本の長さが揃っていれば較正が良い。<T>ブライアスコア</T> {brier.toFixed(3)}（0に近いほど正確）。
+                二本の長さが揃っていれば較正が良い。<T>ブライアスコア</T> {brier.toFixed(3)} 点（0 に近いほど正確。0〜1 の範囲をとる）。
                 回数が少ないので目安だが、ずれの向きは見ておく価値がある。
               </p>
             </div>
           ) : <p style={{ color: P26.dim, fontSize: 12 }}>予測の記録がない。</p>}
         </Sec>
 
-        <Sec n="03" title="触れなかった前提">
+        <Sec n="04" title="触れなかった前提">
           {untouched.length ? (
             <div>
               <p style={{ color: P26.text, fontSize: 13, lineHeight: 2 }} className="mb-3">
@@ -2372,15 +3073,15 @@ function Report({ data, onRestart }) {
         </Sec>
 
         {lockTurn.withdraw == null && (
-          <Sec n="04" title="届かなかった一つ">
+          <Sec n="05" title="届かなかった一つ">
             <p style={{ color: P26.text, fontSize: 13, lineHeight: 2 }} className="mb-4">
               最も効いたはずの手を、あなたは提起できなかった。実力の問題ではない。
             </p>
             <div className="p-3 mb-4" style={{ background: P26.panel, border: `1px solid ${P26.line}` }}>
               {[
                 ["中国からの撤兵 — 提起できる期間", "二期のみ"],
-                ["必要な信用", "85"],
-                ["二期で積める信用の理論上限", "36"],
+                ["必要な信用", "85 / 100"],
+                ["二期で積める信用の理論上限", "36 / 100"],
               ].map(([k, v]) => (
                 <div key={k} className="flex justify-between gap-3" style={{ fontSize: 11, lineHeight: 2.1 }}>
                   <span style={{ color: P26.dim }}>{k}</span>
@@ -2395,7 +3096,7 @@ function Report({ data, onRestart }) {
               モンテカルロ法も、感度分析も、最適化も、二周目のあなたは全部持っていた。
               計算については、1941年の研究員に対して圧倒的に有利だった。
               それでもこの一つには届かない。すべての予測を最高の確信度で当て続けても、
-              期限までに積める信用は 36 が上限で、必要値の半分にも満たないからだ。
+              期限までに積める信用は 36 / 100 が上限で、必要値の半分にも満たないからだ。
             </p>
             <p style={{ color: P26.amber, fontSize: 13, lineHeight: 2 }} className="mb-3">
               これは調整の失敗ではなく、この演習の結論そのものだ。
@@ -2413,7 +3114,7 @@ function Report({ data, onRestart }) {
           </Sec>
         )}
 
-        <Sec n="05" title="九点問題">
+        <Sec n="06" title="九点問題">
           <p style={{ color: P26.text, fontSize: 13, lineHeight: 2 }} className="mb-3">
             九つの点を、四本の直線で、ペンを紙から離さずに全て通す。
           </p>
@@ -2424,7 +3125,7 @@ function Report({ data, onRestart }) {
           </p>
         </Sec>
 
-        <Sec n="06" title="二周の差">
+        <Sec n="07" title="二周の差">
           <div className="grid grid-cols-2 gap-3">
             {[
               { t: "1941", a: ["試算できる回数 3回", "答え合わせ 決定の後", "信用 20 のまま動かず", "前提条件 どれも手が届かない"], c: P26.dim },
@@ -2445,7 +3146,7 @@ function Report({ data, onRestart }) {
           </p>
         </Sec>
 
-        <Sec n="07" title="現代への持ち帰り">
+        <Sec n="08" title="現代への持ち帰り">
           <ul className="space-y-3">
             {[
               "撤退の判断が遅れるのは情報が足りないからではない。判断を下す人間の予測実績が、誰にも見えていないからだ。",
